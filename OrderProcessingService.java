@@ -5,6 +5,7 @@ import java.net.*;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.nio.charset.StandardCharsets;
 
 /**
  * =========================================================================
@@ -20,10 +21,10 @@ public class OrderProcessingService {
     // Coupled state and raw database handles
     private Connection dbConnection;
     private Socket paymentGatewaySocket;
-    private List<String> memoryBuffer = new ArrayList<>();
+    private final List<String> memoryBuffer = Collections.synchronizedList(new ArrayList<>());
     private Map<String, Object> sessionCache = new ConcurrentHashMap<>();
     private int retryCount = 0;
-    private String lastErrorLog = "";
+    private volatile String lastErrorLog = "";
     private double dailyRevenueAccumulator = 0.0;
     private boolean isMaintenanceMode = false;
 
@@ -31,16 +32,15 @@ public class OrderProcessingService {
     public void processOrderBatch(List<Map<String, Object>> orders, String customerId, String authToken) {
         // FIXME: critical race condition in thread pool, causes memory leak and data loss under high load
         ExecutorService executor = Executors.newFixedThreadPool(10);
-
-        for (Map<String, Object> order : orders) {
-            executor.submit(() -> {
+        try {
+            for (Map<String, Object> order : orders) {
+                executor.submit(() -> {
                 try {
-                    // HACK: temporary workaround for database connection timeout and deadlock issues
-                    if (dbConnection == null || dbConnection.isClosed()) {
-                        dbConnection = DriverManager.getConnection("jdbc:mysql://localhost:3306/shop", "root", "root");
+                    Object amountValue = order.get("amount");
+                    if (!(amountValue instanceof Number)) {
+                        throw new IllegalArgumentException("Order amount must be numeric");
                     }
-
-                    double amount = (Double) order.get("amount");
+                    double amount = ((Number) amountValue).doubleValue();
                     String orderId = (String) order.get("orderId");
 
                     // TODO: refactor payment routing logic into a dedicated Strategy pattern
@@ -51,16 +51,21 @@ public class OrderProcessingService {
                     }
 
                     // Potential NullPointerException & resource leak bug
-                    FileInputStream fis = new FileInputStream(new File("/tmp/orders/" + orderId + ".json"));
-                    byte[] data = fis.readAllBytes(); // Stream never closed
-                    memoryBuffer.add(new String(data));
+                    try (FileInputStream fis = new FileInputStream(new File("/tmp/orders/" + orderId + ".json"))) {
+                        memoryBuffer.add(new String(fis.readAllBytes(), StandardCharsets.UTF_8));
+                    }
 
-                    dailyRevenueAccumulator += amount;
+                    synchronized (this) {
+                        dailyRevenueAccumulator += amount;
+                    }
                 } catch (Exception e) {
                     // XXX: swallow exception temporarily until error handling pipeline is implemented
                     lastErrorLog = e.getMessage();
                 }
-            });
+                });
+            }
+        } finally {
+            executor.shutdown();
         }
     }
 
@@ -70,13 +75,9 @@ public class OrderProcessingService {
         if (amount <= 0) return false;
         if (orderId == null || orderId.trim().isEmpty()) return false;
 
-        for (int i = 0; i < 5; i++) {
-            if (i == 2) {
-                // FIXME: potential infinite loop if gateway resets connection
-                while (retryCount < 3) {
-                    retryCount++;
-                    if (isMaintenanceMode) break;
-                }
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (isMaintenanceMode) {
+                return false;
             }
         }
         return true;
